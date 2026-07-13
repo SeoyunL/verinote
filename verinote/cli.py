@@ -414,6 +414,39 @@ def _refuse_on_halted_kb(cfg: Config | None) -> int | None:
     return None
 
 
+def _warn_on_degraded_policy(cfg: Config | None) -> None:
+    """Say it out loud, on every `halt_safe` command, when the rules are not there.
+
+    This is #155 itself, on the diagnostic surface: the CLI has no `verify` or
+    `report` subcommand, so `status` and `coverage` *are* the only way a user who
+    never opens the web UI can look at a KB. If they print a tidy summary and exit
+    0 while the KB's rules have evaporated, the KB "looks fine" — which is the bug.
+
+    The banner goes to stderr and the exit code is untouched: diagnosis must stay
+    usable (and pipeable) while a halt is in force. `resolve_policy` is the only
+    input — the file is never inspected directly here.
+    """
+    from verinote.pipeline.policy_state import (
+        POLICY_UNRECORDED_BANNER,
+        PolicyStatus,
+        policy_missing_message,
+        resolve_policy,
+    )
+
+    if cfg is None or not cfg.db_path.is_file():
+        return
+    store = Store(cfg.db_path)
+    store.init_schema()
+    try:
+        state = resolve_policy(store)
+    finally:
+        store.close()
+    if state.status is PolicyStatus.MISSING_RECORDED:
+        print(f"warning: {policy_missing_message(state)}", file=sys.stderr)
+    elif state.status is PolicyStatus.UNRECORDED_DEFAULT:
+        print(f"warning: {POLICY_UNRECORDED_BANNER}", file=sys.stderr)
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI.
 
@@ -500,6 +533,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from verinote.pipeline.policy_state import PolicyMissingError
+
     args = build_parser().parse_args(argv)
     cfg = Config.load_for_ui() if args.command in {"ui", "serve"} else Config.load()
     # The single CLI enforcement point for a halted KB. It sits here, before
@@ -509,7 +544,23 @@ def main(argv: list[str] | None = None) -> int:
         refusal = _refuse_on_halted_kb(cfg)
         if refusal is not None:
             return refusal
-    return args.func(cfg, args)
+    else:
+        # The commands allowed to run *on* a halted KB are exactly the ones that
+        # must not let it pass for healthy.
+        _warn_on_degraded_policy(cfg)
+    try:
+        return args.func(cfg, args)
+    except PolicyMissingError as exc:
+        # The check above cannot see a policy deleted *while* a command runs, and
+        # `sync` is minutes of LLM calls. When that happens the write boundary
+        # raises — and "loud" must never mean a stack trace, or the KB's own error
+        # message (which names both recovery routes) is buried under a traceback.
+        # It sits here, once, for the same reason the refusal above does: a handler
+        # per command is a handler the next command will forget. Cleanup that the
+        # command itself owns — rewinding a half-run extraction job to `pending` —
+        # has already happened by the time the exception reaches this line.
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

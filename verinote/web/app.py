@@ -8,6 +8,7 @@ swaps a single row partial). No JS build step. The app owns one `Store` (SQLite)
 from __future__ import annotations
 
 from importlib import resources
+import logging
 from pathlib import Path
 import threading
 import unicodedata
@@ -92,6 +93,8 @@ from verinote.store.fact_input import structural_term, term_input_kind
 _TEMPLATES = resources.files("verinote.web").joinpath("templates")
 _STATIC = resources.files("verinote.web").joinpath("static")
 
+_log = logging.getLogger(__name__)
+
 # What is served while a KB's recorded policy file is missing. Default-deny, and
 # the allowlist is keyed by (method, path) rather than path alone: a page needed
 # to *diagnose* the halt is not licence to *write* under the same prefix. The
@@ -118,6 +121,9 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     app = FastAPI(title="verinote")
     app.state.cfg = cfg
     app.state.store = None
+    # Which interrupted jobs this process actually restarted at startup. Recorded
+    # so "a halted KB starts no workers" is an assertable fact, not a hope.
+    app.state.resumed_job_ids = []
     if cfg is not None:
         store = Store(cfg.db_path)
         store.init_schema()
@@ -697,6 +703,15 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                     )
                     if cfg.auto_accept_recommendations:
                         apply_auto_accept_recommendations(worker_store)
+            except PolicyMissingError as e:
+                # MUST stay above `except Exception`. This worker runs outside the
+                # HTTP middleware, so it is the one place a halted KB could still be
+                # written to — and `fail_extraction_job` *is* a write. Marking the
+                # job "failed" here would also be a lie: the extraction did not
+                # fail, the KB's rules are gone. `process_extraction_job` has
+                # already rewound the job to `pending`; all that is left is to say
+                # so, in the log, touching nothing.
+                _log.warning("extraction job %s halted: %s", job_id, e)
             except LLMError as e:
                 with Store(cfg.db_path) as worker_store:
                     worker_store.init_schema()
@@ -732,10 +747,27 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             _delete_source_file(path, root)
 
     def _resume_source_extraction_jobs() -> None:
+        """Restart jobs interrupted by a restart — unless the KB is halted.
+
+        This runs at `create_app`, i.e. `verinote ui` reaches it with zero HTTP
+        requests served, and the workers it starts run outside the request
+        middleware. Without this gate, merely *launching the UI* on a halted KB
+        would set its pending jobs marching against a KB whose rules are gone.
+        `ui` is a launcher; launching must not be a write.
+
+        `assert_writable` is the same predicate the middleware, the CLI and the
+        worker use — the policy state is never re-derived here.
+        """
         if app.state.store is None or app.state.cfg is None:
+            return
+        try:
+            assert_writable(app.state.store)
+        except PolicyMissingError as exc:
+            _log.warning("not resuming extraction jobs: %s", exc)
             return
         for job in app.state.store.source_extraction_jobs():
             if job["status"] in {"pending", "running"}:
+                app.state.resumed_job_ids.append(int(job["id"]))
                 _start_source_extraction(int(job["id"]), app.state.cfg)
 
     @app.get("/", response_class=HTMLResponse)

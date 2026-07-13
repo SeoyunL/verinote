@@ -671,6 +671,377 @@ def test_extraction_worker_halts_when_policy_disappears_mid_job(tmp_path):
     store.close()
 
 
+class _CountingClient:
+    """Records every LLM call so "the guard fired first" is checkable."""
+
+    name = "fake"
+
+    def __init__(self):
+        self.calls = 0
+
+    def extract_facts(self, *, source_text: str, schema_hint: str = ""):
+        from verinote.llm.base import ExtractedFact
+
+        self.calls += 1
+        return [ExtractedFact(source_text, "is_a", "chunk", 0.9)]
+
+
+class _PolicyDeletingOnFirstCallClient(_CountingClient):
+    """Deletes the KB's policy file during the *first* chunk's LLM call."""
+
+    def __init__(self, policy_path):
+        super().__init__()
+        self.policy_path = policy_path
+
+    def extract_facts(self, *, source_text: str, schema_hint: str = ""):
+        facts = super().extract_facts(source_text=source_text, schema_hint=schema_hint)
+        self.policy_path.unlink()
+        return facts
+
+
+def _chunked_job(store: Store, chunks: list[str]) -> int:
+    source_id = store.add_source("sources/a.txt")
+    job_id = store.create_extraction_job(
+        source_id=source_id, provider="fake", model="m", total_chunks=len(chunks)
+    )
+    store.add_source_chunks(job_id=job_id, source_id=source_id, chunks=chunks)
+    return job_id
+
+
+def _job_snapshot(store: Store, job_id: int) -> tuple:
+    job = store.get_extraction_job(job_id)
+    chunks = store.source_chunks(job_id)
+    first_run = store.get_run(1)
+    return (
+        tuple(job),
+        tuple(tuple(chunk) for chunk in chunks),
+        None if first_run is None else tuple(first_run),
+        len(store.facts()),
+    )
+
+
+def _halted_job_kb(tmp_path, chunks: list[str]):
+    """A KB with a *pending* extraction job whose policy file was then deleted."""
+    store = _store(tmp_path)
+    path = _write_policy(tmp_path)
+    store.record_policy_marker(policy_sha256(path.read_text(encoding="utf-8")), origin="scaffold")
+    job_id = _chunked_job(store, chunks)
+    path.unlink()
+    return store, job_id, path
+
+
+# --- 3. the job-start guard: a halted KB never even reaches the LLM ---
+
+
+def test_process_extraction_job_on_halted_kb_writes_nothing_and_calls_no_llm(tmp_path):
+    """The guard at the top of `process_extraction_job` is the one that pays.
+
+    Without it the job is marked running, a `runs` row is opened and every chunk
+    is shipped to the LLM — money spent to produce candidates that the write
+    boundary will then refuse. Nothing may move.
+    """
+    from verinote.pipeline.extract import process_extraction_job
+
+    store, job_id, _ = _halted_job_kb(tmp_path, ["alpha", "beta"])
+    before = _job_snapshot(store, job_id)
+    client = _CountingClient()
+
+    with pytest.raises(PolicyMissingError):
+        process_extraction_job(store, client, job_id=job_id)
+
+    assert client.calls == 0
+    assert _job_snapshot(store, job_id) == before
+    assert store.get_extraction_job(job_id)["status"] == "pending"
+    assert store.get_run(1) is None  # not even a `runs` row was opened
+    store.close()
+
+
+# --- 4. a halt mid-job rewinds the job; it never leaves a zombie `running` ---
+
+
+def test_halt_mid_job_rewinds_the_job_to_pending(tmp_path):
+    """The contract: no knowledge is written, and no job is stranded `running`.
+
+    A chunk already claimed when the policy vanished (the deletion happens during
+    its LLM call) is rewound to `pending`, so is the job, and the `runs` row that
+    was opened while the KB was still healthy says what happened instead of being
+    blank. Leaving the job `running` would brick it: nothing else resets it, and
+    the web resume path is itself gated on the policy.
+    """
+    from verinote.pipeline.extract import HALTED_RUN_SUMMARY, process_extraction_job
+
+    store = _store(tmp_path)
+    path = _write_policy(tmp_path)
+    store.record_policy_marker(policy_sha256(path.read_text(encoding="utf-8")), origin="scaffold")
+    job_id = _chunked_job(store, ["alpha", "beta"])
+    client = _PolicyDeletingOnFirstCallClient(path)
+
+    with pytest.raises(PolicyMissingError):
+        process_extraction_job(store, client, job_id=job_id)
+
+    assert store.get_extraction_job(job_id)["status"] == "pending"
+    assert [chunk["status"] for chunk in store.source_chunks(job_id)] == ["pending", "pending"]
+    assert store.facts() == []  # no knowledge entered the halted KB
+    assert store.get_run(1)["summary"] == HALTED_RUN_SUMMARY  # not a blank run row
+    assert store.get_run(2) is None
+    store.close()
+
+
+def test_halt_between_chunks_never_claims_the_next_chunk(tmp_path):
+    """A chunk after the deletion is not even marked `running`.
+
+    `mark_chunk_running` writes (status + `attempts` + 1). The write boundary
+    inside `_extract_chunk` runs *after* that, so it cannot prevent it — the guard
+    has to sit before the chunk is claimed.
+    """
+    from verinote.pipeline.extract import process_extraction_job
+
+    store = _store(tmp_path)
+    path = _write_policy(tmp_path)
+    store.record_policy_marker(policy_sha256(path.read_text(encoding="utf-8")), origin="scaffold")
+    job_id = _chunked_job(store, ["alpha", "beta"])
+    client = _CountingClient()
+
+    # the policy vanishes *between* chunks: after chunk 1 is committed, before
+    # chunk 2 is claimed (a human `rm`, a synced folder, a botched deploy)
+    mark_chunk_done = store.mark_chunk_done
+
+    def delete_policy_after_first_chunk(chunk_id: int, *, candidates: int = 0) -> None:
+        mark_chunk_done(chunk_id, candidates=candidates)
+        if path.is_file():
+            path.unlink()
+
+    store.mark_chunk_done = delete_policy_after_first_chunk
+
+    with pytest.raises(PolicyMissingError):
+        process_extraction_job(store, client, job_id=job_id)
+
+    assert client.calls == 1  # chunk 2 was never sent to the LLM
+    beta = store.source_chunks(job_id)[1]
+    assert beta["status"] == "pending"
+    assert int(beta["attempts"]) == 0  # never claimed, so never counted as attempted
+    assert store.get_extraction_job(job_id)["status"] == "pending"
+    store.close()
+
+
+# --- 1. launching the UI on a halted KB must not set its workers marching ---
+
+
+def _ui_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    monkeypatch.setenv("APPDATA", str(tmp_path / "appdata"))
+
+
+def _ui_cfg(tmp_path):
+    from verinote.config import Config
+
+    return Config(
+        root=tmp_path,
+        db_path=tmp_path / "kb.sqlite",
+        provider="anthropic",
+        model="m",
+        api_key=None,
+        base_url=None,
+    )
+
+
+def test_create_app_on_halted_kb_resumes_no_jobs_and_touches_no_row(tmp_path, monkeypatch):
+    """`verinote ui` is a launcher. Launching must not write to a halted KB.
+
+    `create_app` resumes interrupted jobs in worker threads that run *outside* the
+    HTTP middleware — so with zero requests served, merely starting the UI used to
+    drive a pending job into the halted KB and mark it `failed`.
+    """
+    pytest.importorskip("fastapi")
+
+    from verinote.web.app import create_app
+
+    _ui_env(tmp_path, monkeypatch)
+    store, job_id, _ = _halted_job_kb(tmp_path, ["alpha"])
+    before = _job_snapshot(store, job_id)
+    store.close()
+
+    app = create_app(_ui_cfg(tmp_path))
+
+    assert app.state.resumed_job_ids == []
+    store = _store(tmp_path)
+    assert _job_snapshot(store, job_id) == before
+    assert store.get_extraction_job(job_id)["status"] == "pending"
+    store.close()
+
+
+def test_create_app_on_a_healthy_kb_still_resumes_jobs(tmp_path, monkeypatch):
+    """The control: the halt gate must not have killed resume outright."""
+    pytest.importorskip("fastapi")
+
+    import verinote.web.app as webapp
+
+    _ui_env(tmp_path, monkeypatch)
+    store = _store(tmp_path)
+    path = _write_policy(tmp_path)
+    store.record_policy_marker(policy_sha256(path.read_text(encoding="utf-8")), origin="scaffold")
+    job_id = _chunked_job(store, ["alpha"])
+    store.close()
+    monkeypatch.setattr(webapp, "get_client", lambda cfg: _CountingClient())
+
+    app = webapp.create_app(_ui_cfg(tmp_path))
+
+    assert app.state.resumed_job_ids == [job_id]
+
+
+def test_web_worker_never_marks_a_halted_kb_job_failed(tmp_path, monkeypatch):
+    """`fail_extraction_job` is a write, and "failed" is a lie: the LLM was fine.
+
+    The worker's `except Exception` used to swallow `PolicyMissingError` and write
+    `status='failed'` into the very KB the halt exists to protect.
+    """
+    pytest.importorskip("fastapi")
+
+    from fastapi.testclient import TestClient
+
+    import verinote.web.app as webapp
+    from verinote.pipeline.extract import HALTED_RUN_SUMMARY
+
+    _ui_env(tmp_path, monkeypatch)
+    store = _store(tmp_path)
+    path = _write_policy(tmp_path)
+    store.record_policy_marker(policy_sha256(path.read_text(encoding="utf-8")), origin="scaffold")
+    store.close()
+
+    client = _PolicyDeletingOnFirstCallClient(path)
+    monkeypatch.setattr(webapp, "get_client", lambda cfg: client)
+    app = webapp.create_app(_ui_cfg(tmp_path))
+    http = TestClient(app)
+
+    resp = http.post(
+        "/sources",
+        files={"file": ("note.txt", b"some text", "text/plain")},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303
+
+    store = app.state.store
+    _wait_for(lambda: _assert(client.calls == 1, "the worker never called the LLM"))
+    job_id = int(store.source_extraction_jobs()[0]["id"])
+    _wait_for(
+        lambda: _assert(
+            store.get_extraction_job(job_id)["status"] != "running",
+            "the worker left the job running",
+        )
+    )
+
+    job = store.get_extraction_job(job_id)
+    assert job["status"] == "pending"  # rewound, resumable — not "failed"
+    assert "failed" not in str(job["message"])
+    assert store.facts() == []
+    assert store.get_run(1)["summary"] == HALTED_RUN_SUMMARY
+
+
+def _assert(condition: bool, message: str) -> None:
+    assert condition, message
+
+
+def _wait_for(assertion, *, timeout: float = 5.0) -> None:
+    import time
+
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            assertion()
+            return
+        except AssertionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+# --- 2. a policy lost mid-`sync` is loud, not a traceback ---
+
+
+def test_sync_reports_a_policy_lost_mid_run_instead_of_crashing(tmp_path, monkeypatch, capsys):
+    """`loud` means an error message and an exit code, never a stack trace."""
+    import verinote.llm as llm
+    from verinote.pipeline.extract import HALTED_RUN_SUMMARY
+
+    _env(monkeypatch, tmp_path)
+    assert cli.main(["init"]) == 0
+    src = tmp_path / "input.txt"
+    src.write_text("Ada is_a engineer\n", encoding="utf-8")
+    assert cli.main(["ingest", str(src)]) == 0
+
+    policy = tmp_path / POLICY_RELPATH
+    client = _PolicyDeletingOnFirstCallClient(policy)
+    monkeypatch.setattr(llm, "get_client", lambda cfg: client)
+    capsys.readouterr()
+
+    rc = cli.main(["sync"])  # must not raise
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "error:" in err
+    assert "policy reset --force" in err
+    assert "Traceback" not in err
+
+    store = Store(tmp_path / "kb.sqlite")
+    store.init_schema()
+    job = store.source_extraction_jobs()[0]
+    assert job["status"] == "pending"  # resumable once the policy is restored
+    assert store.facts() == []
+    assert store.get_run(1)["summary"] == HALTED_RUN_SUMMARY
+    store.close()
+
+
+# --- 5. the CLI's diagnostic surface must not let a halted KB look healthy ---
+
+
+def test_status_and_coverage_announce_the_halt_on_stderr(tmp_path, monkeypatch, capsys):
+    """#155 on the CLI: `status` is the only window a non-web user has.
+
+    It stays exit-0 and keeps printing — a halt you cannot inspect is a brick —
+    but it must say, out loud, that this KB's rules are gone.
+    """
+    _halted_cli_kb(tmp_path, monkeypatch)
+    capsys.readouterr()
+
+    assert cli.main(["status"]) == 0
+    status = capsys.readouterr()
+    assert "KB:" in status.out  # diagnosis still works
+    assert "policy file" in status.err and "missing" in status.err
+    assert "policy reset --force" in status.err
+
+    assert cli.main(["coverage"]) == 0
+    coverage = capsys.readouterr()
+    assert "coverage:" in coverage.out
+    assert "policy file" in coverage.err and "missing" in coverage.err
+
+
+def test_status_announces_an_unrecorded_policy(tmp_path, monkeypatch, capsys):
+    """The other dishonest-green state: rules that were never this KB's."""
+    _env(monkeypatch, tmp_path)
+    store = Store(tmp_path / "kb.sqlite")
+    store.init_schema()
+    store.close()
+    capsys.readouterr()
+
+    assert cli.main(["status"]) == 0
+
+    err = capsys.readouterr().err
+    assert "policy_unrecorded" in err
+    assert "shipped default policy was used" in err
+
+
+def test_status_on_a_healthy_kb_says_nothing_about_the_policy(tmp_path, monkeypatch, capsys):
+    """The banner must be a signal, not wallpaper."""
+    _env(monkeypatch, tmp_path)
+    assert cli.main(["init"]) == 0
+    capsys.readouterr()
+
+    assert cli.main(["status"]) == 0
+
+    assert capsys.readouterr().err == ""
+
+
 def test_store_has_no_public_meta_delete(tmp_path):
     """No public API may drop a policy marker — that is the silent-fallback bug."""
     store = _store(tmp_path)

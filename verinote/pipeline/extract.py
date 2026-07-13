@@ -21,7 +21,7 @@ from verinote.pipeline.corroboration import (
     store_relation_aliases,
 )
 from verinote.pipeline.normalize import normalize_for_extraction
-from verinote.pipeline.policy_state import assert_writable
+from verinote.pipeline.policy_state import PolicyMissingError, assert_writable
 from verinote.prompts import PromptError, render_prompt
 from verinote.store import Store
 from verinote.store.fact_input import structural_term
@@ -154,6 +154,16 @@ class ChunkedExtractionResult:
     failed_chunks: int = 0
 
 
+# The summary left on the `runs` row of a job that hit a halt. `add_run` happens
+# while the KB is still healthy, so a mid-job halt would otherwise leave a blank
+# run row behind — a silent artifact of exactly the event this whole mechanism
+# exists to make loud.
+HALTED_RUN_SUMMARY = (
+    "halted: this KB's recorded logic policy file is missing; the job was rolled "
+    "back to pending and no candidate facts were written"
+)
+
+
 def process_extraction_job(
     store: Store,
     client: LLMClient,
@@ -164,10 +174,19 @@ def process_extraction_job(
     """Process pending chunks for one durable extraction job.
 
     Raises `PolicyMissingError` if this KB's recorded logic policy file is gone —
-    both at the start and, per chunk, at the write boundary in `_extract_chunk`.
-    A job is long-running (one LLM call per chunk) and the CLI's start-of-command
-    check cannot see a policy deleted *after* the job began, so the check has to
-    live next to the write itself.
+    at the start, before each chunk is claimed, and per chunk at the write
+    boundary in `_extract_chunk`. A job is long-running (one LLM call per chunk)
+    and the CLI's start-of-command check cannot see a policy deleted *after* the
+    job began, so the check has to live next to the write itself.
+
+    The contract on a halted KB, precisely: **no candidate fact and no evidence
+    row is ever written**. Job/chunk bookkeeping is not equally absolute — the
+    policy can vanish during the LLM call of a chunk that was already claimed —
+    so bookkeeping is only ever *rewound*: on a halt the in-flight chunk and the
+    job go back to `pending` (`_rollback_halted_job`), leaving the job resumable
+    once a human recovers the policy. What must never happen is a job left
+    `running` forever, or a halted KB told a job "failed" as if the LLM was at
+    fault.
     """
     assert_writable(store)
     job = store.get_extraction_job(job_id)
@@ -181,8 +200,55 @@ def process_extraction_job(
     store.mark_extraction_job_running(job_id)
     run_id = store.add_run(provider=job["provider"], model=job["model"])
 
+    try:
+        _process_chunks(
+            store,
+            client,
+            job=job,
+            source=source,
+            job_id=job_id,
+            run_id=run_id,
+            schema_hint=schema_hint,
+        )
+    except PolicyMissingError:
+        _rollback_halted_job(store, job_id=job_id, run_id=run_id)
+        raise
+
+    store.finish_extraction_job(job_id)
+    final = store.get_extraction_job(job_id)
+    summary = (
+        f"{source['path']}: {final['completed_chunks']}/{final['total_chunks']} "
+        f"chunk(s), {final['candidate_count']} candidate(s), "
+        f"{final['failed_chunks']} failed"
+    )
+    store.set_run_summary(run_id, summary)
+    return ChunkedExtractionResult(
+        job_id=job_id,
+        candidates=int(final["candidate_count"]),
+        completed_chunks=int(final["completed_chunks"]),
+        failed_chunks=int(final["failed_chunks"]),
+    )
+
+
+def _process_chunks(
+    store: Store,
+    client: LLMClient,
+    *,
+    job,
+    source,
+    job_id: int,
+    run_id: int,
+    schema_hint: str,
+) -> int:
+    """Claim and extract pending chunks one at a time. Returns candidates inserted."""
     candidates = 0
     while chunk := store.next_pending_chunk(job_id):
+        # Before the chunk is *claimed*, not after: `mark_chunk_running` writes
+        # (status + attempts) and a KB whose rules are gone must not collect
+        # bookkeeping for work it is never going to do. The write boundary inside
+        # `_extract_chunk` cannot cover this — it only runs once the chunk has
+        # already been marked running.
+        assert_writable(store)
         running = store.mark_chunk_running(int(chunk["id"]))
         if running is None:
             continue
@@ -205,21 +271,26 @@ def process_extraction_job(
             continue
         candidates += inserted
         store.mark_chunk_done(int(running["id"]), candidates=inserted)
+    return candidates
 
-    store.finish_extraction_job(job_id)
-    final = store.get_extraction_job(job_id)
-    summary = (
-        f"{source['path']}: {final['completed_chunks']}/{final['total_chunks']} "
-        f"chunk(s), {final['candidate_count']} candidate(s), "
-        f"{final['failed_chunks']} failed"
-    )
-    store.set_run_summary(run_id, summary)
-    return ChunkedExtractionResult(
-        job_id=job_id,
-        candidates=int(final["candidate_count"]),
-        completed_chunks=int(final["completed_chunks"]),
-        failed_chunks=int(final["failed_chunks"]),
-    )
+
+def _rollback_halted_job(store: Store, *, job_id: int, run_id: int) -> None:
+    """Rewind a job that hit a halt so it is resumable, never a zombie.
+
+    The one chunk that was in flight when the policy vanished is already marked
+    `running` (it was claimed while the KB was still healthy). Leaving it there
+    would leave the job `running` forever: nothing else ever resets it, and the
+    web resume path is itself gated on the policy. So the running chunk goes back
+    to `pending`, which also drops the job back to `pending`, and the run row gets
+    an honest summary instead of a blank one.
+
+    These are bookkeeping writes to a halted KB, and they are deliberate: the
+    contract is that a halted KB gains no *knowledge* (no candidate fact, no
+    evidence row), not that its job table is frozen. Rewinding is the only
+    direction allowed — nothing here advances a job's progress.
+    """
+    store.reset_running_chunks(job_id)
+    store.set_run_summary(run_id, HALTED_RUN_SUMMARY)
 
 
 def _extract_chunk(
